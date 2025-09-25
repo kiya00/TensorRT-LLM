@@ -1,0 +1,294 @@
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+from torch.cuda import CUDAGraph
+from torch.utils._pytree import TreeSpec, tree_flatten
+import thunder
+
+from ...utils.cuda_graph import CudaGraphWarmUpPhase
+from ...utils.logger import ad_logger
+from ..compiler import BackendCompiler, BackendRegistry, _flatten_args
+
+def _get_input_tensors(gm, args,):
+    node_inputs = gm.graph.find_nodes(op="placeholder", sort=True)
+    input_tensor_list = [[idx, arg] for idx,(n,arg) in enumerate(zip(node_inputs,args)) if n.type is torch.Tensor and not n.type is torch.nn.Parameter]
+    print(len(input_tensor_list),"++++++++++++")
+    return input_tensor_list
+
+def replace_input(target,indexes,result):
+    assert len(target)==len(indexes), "replace inputs mismatch"
+    t_iter = iter(target)
+    return [next(t_iter) if idx in indexes else a for idx,a in enumerate(result)]
+
+
+def pad_to_bucket(input_ids, position_ids, bucket_bs, pad_token_id=0):
+    bs = input_ids.shape[0]
+    pad_len = bucket_bs - bs
+    assert pad_len >= 0, "bucket_bs must be >= bs"
+
+    if pad_len > 0:
+        # 构造 padding 部分
+        pad_input_ids = torch.full((pad_len, 1), pad_token_id, dtype=input_ids.dtype, device=input_ids.device)
+        pad_position_ids = torch.zeros((pad_len, 1), dtype=position_ids.dtype, device=position_ids.device)
+
+        # 拼接原始和 padding
+        input_ids = torch.cat([input_ids, pad_input_ids], dim=0)
+        position_ids = torch.cat([position_ids, pad_position_ids], dim=0)
+
+    return input_ids, position_ids, bs
+class CapturedGraph(nn.Module):
+    def __init__(
+        self,
+        model: nn.Module,
+        cm,
+        max_batch_size: int,
+        cuda_graph_batch_sizes: List[int] = None,
+        num_batched_inputs: Optional[int] = 1,  # number of batched, dynamic inputs...
+    ):
+        super().__init__()
+        self.model = model
+        self.cm = cm
+        self.max_batch_size = max_batch_size
+        self.num_batched_inputs = num_batched_inputs if num_batched_inputs is not None else 1
+        self.graphs: Dict[Tuple[int, ...], CUDAGraph] = {}
+        self._input_buffers: List[torch.Tensor] = [
+            torch.empty(0, 1) for _ in range(self.num_batched_inputs)
+        ]
+        self._out_buffer_flat: List[torch.Tensor] = None
+        self._args_hash: Optional[Tuple[int, ...]] = None
+        self.cuda_graph_batch_sizes = (
+            cuda_graph_batch_sizes
+            if cuda_graph_batch_sizes is not None
+            else self._get_graph_batch_sizes(self.max_batch_size)
+        )
+
+    def _get_hash(self, flat_args: List[Any]) -> Tuple[int, ...]:
+        return tuple(hash(a) for a in flat_args)
+
+    @staticmethod
+    def round_up_to_closest(batch_sizes: Iterable[int], bs: int) -> Optional[int]:
+        """Return closest batch size larger or equal to bs."""
+        if bs > max(batch_sizes, default=0):
+            return None
+        return min(batch_sizes, key=lambda x: (x < bs, abs(x - bs)), default=None)
+
+    def round_to_cuda_batch_size(self, bs: int) -> int:
+        """Round batch size to the nearest cuda batch size."""
+        return self.round_up_to_closest(self.cuda_graph_batch_sizes, bs)
+
+    def _capture_one_graph(self, *args, **kwargs) -> torch.cuda.CUDAGraph:
+        """Capture and return one cuda graph."""
+        # warm-up
+        with CudaGraphWarmUpPhase():
+            for _ in range(3):
+                thunder.jit(self.model)(*args, **kwargs)
+
+        # capture graph now
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            # compute output
+            out = thunder.jit(self.model)(*args, **kwargs)
+            # write out into output buffer up to out batch size
+            out_flat, out_spec = tree_flatten(out)
+            assert out_spec == self._out_spec, "Output spec mismatch."
+            for o_buffer, o in zip(self._out_buffer_flat, out_flat):
+                o_buffer[: o.shape[0]] = o
+        torch.cuda.synchronize()
+
+        return graph
+
+    @staticmethod
+    def _get_graph_batch_sizes(
+        max_bs: int, extra: Optional[List[int]] = None, multiplier: int = 128
+    ) -> List[int]:
+        """Heuristic to set batch sizes for graph capture."""
+        # do 1, max_bs, and extra as special batch sizes
+        batch_sizes = {1, max_bs, *(extra or [])}
+
+        # add all multiples of multiplier up to max_bs
+        batch_sizes.update(range(multiplier, max_bs + 1, multiplier))
+
+        # return as sorted list
+        return sorted(batch_sizes)
+
+    def capture_graph(self, *args, **kwargs):
+        """Capture and pre-fetch the graph for variable batch size."""
+        # flatten args, kwargs
+
+        # extract the batched input tensors
+        # args_batched = all_args_flat[: self.num_batched_inputs]
+        # args_static = all_args_flat[self.num_batched_inputs :]
+        args_lists = _get_input_tensors(self.model, args)[:2]
+        args_idxes = [a[0] for a in args_lists]
+        #args_batched = [a[1] for a in args_lists]
+        args_batched = self.cm.args[:2]
+
+        # set the args hash --> this is used to compare the static inputs during graph replay
+        # self._args_hash = self._get_hash(args_static)
+
+        # sanity checks on the batched inputs
+        msg_bs = "Max batch size too small."
+        msg_ndim = "Expecting at least a 2D for batched input tensors."
+        assert all(self.max_batch_size >= input.shape[0] for input in args_batched), msg_bs
+        assert all(input.ndim > 1 for input in args_batched), msg_ndim
+
+
+        # capture graph now for a range of batch sizes
+        for bs in self.cuda_graph_batch_sizes:
+            ad_logger.info(f"Capturing graph for batch size: {bs}, {self.cuda_graph_batch_sizes}")
+
+            # setup args, kwargs
+            # Expand first tensor to bs and pad with 1s
+            # Use first element of first tensor and repeat to bs
+            first_tensor = args_batched[0]
+            first_elem = first_tensor[0:1]  # Get first element and keep dims
+            first_padded = first_elem.expand(bs, -1)  # Expand to [bs,1] keeping other dims
+
+            # Use first element of second tensor and repeat to bs
+            second_tensor = args_batched[1]
+            second_elem = second_tensor[0:1]  # Get first element and keep dims
+            second_padded = second_elem.expand(bs, -1)  # Expand to [bs,1] keeping other dims
+
+            new_args = [first_padded, second_padded]
+            new_args_iter=iter(new_args)
+            all_new_args = [next(new_args_iter) if idx in args_idxes else arg for idx,arg in enumerate(args)]
+
+            # capture graph for truncated inputs
+            combined_shape = sum((input.shape for input in new_args), start=())
+            #jmodel = thunder.jit(self.model)
+            #self.cm.info.pages_per_seq.fill_(bs // self.cm.info.page_size)
+            for idx,a in enumerate(all_new_args):
+                if isinstance(a, int):
+                    print(a, bs)
+                    all_new_args[idx]=bs
+                else:
+                    print(a.shape)
+
+            #print("start+++++++++++++++")
+            #self.model(*all_new_args)
+            #print("end++++++++++++++++++")
+            from thunder.dynamo.benchmark_utils import ThunderCompilerOnGraphModuleSpecification
+            thunder_compiler_on_gm = ThunderCompilerOnGraphModuleSpecification(nv_skip_cache=False,)
+            split_gm, bd = thunder_compiler_on_gm.compile(self.model)
+
+            #jmodel = thunder.jit(self.model)
+            # warmup
+            out = split_gm(*all_new_args)
+            self.graphs[combined_shape] = split_gm #jmodel
+
+    def forward(self, *args, **kwargs) -> Any:
+        """Run the compiled graph."""
+        # flatten args, kwargs
+        # all_args_flat = _flatten_args(self._in_spec, *args, **kwargs)
+
+        # extract the batched input tensors
+        # args_batched = all_args_flat[: self.num_batched_inputs]
+        # args_static = all_args_flat[self.num_batched_inputs :]
+        args_lists = _get_input_tensors(self.model, args)[:2]
+        args_idxes = [a[0] for a in args_lists]
+        #args_batched = [a[1] for a in args_lists]
+        args_batched = [args[i] for i in args_idxes]
+        args_batched = args_batched[:2]
+        ori_bs=args_batched[0].shape[0]
+
+        # check if args_static match the stored hash
+        # if self._args_hash != self._get_hash(args_static):
+        #     return self.model(*args, **kwargs)
+
+        # Calculate rounded-up shapes for each input
+        rounded_shapes = [
+            (self.round_to_cuda_batch_size(input.shape[0]),) + input.shape[1:]
+            for input in args_batched
+        ]
+        combined_shape = sum(rounded_shapes, start=())
+
+        # regular forward for non-matching shapes
+        if combined_shape not in self.graphs:
+            # return self.model(*args, **kwargs)
+            print("bucket fallback: ", args_batched[0].shape, args_batched[1].shape)
+            #return thunder.jit(self.model)(*args)
+            return torch.compile(self.model)(*args)
+        print("bucket hit:", args_batched[0].shape, args_batched[1].shape)
+        *new_args,_=pad_to_bucket(*args_batched,rounded_shapes[0][0])
+        print(new_args[0].shape)
+        new_args_iter = iter(new_args)
+        all_new_args = [next(new_args_iter) if idx in args_idxes else a for idx,a in enumerate(args)]
+        for idx,a in enumerate(all_new_args):
+            if isinstance(a, int):
+                all_new_args[idx]=rounded_shapes[0][0]
+        out= self.graphs[combined_shape](*all_new_args)
+        print(len(out))
+        out=[o[:ori_bs] for o in out]
+        return out
+
+        # # copy inputs to input buffers
+        # # for i, input_tensor in enumerate(args_batched):
+        # #     self._input_buffers[i][: input_tensor.shape[0]] = input_tensor
+
+        # # # run forward pass via graph
+        # # self.graphs[combined_shape].replay()
+
+        # # retrieve output from buffer, cut to batch size, and unflatten
+        # bs = args_batched[0].shape[0]
+        # out_flat = [o_b[:bs].detach().clone() for o_b in self._out_buffer_flat]
+        # return self._out_spec.unflatten(out_flat)
+
+
+
+@BackendRegistry.register("thunder")
+class ThunderOptCompiler(BackendCompiler):
+    def __init__(
+        self,
+        gm,
+        args: Tuple[Any, ...],
+        cm,
+        kwargs: Optional[Dict[str, Any]] = None,
+        dynamic_shapes=None,
+        compiler_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        self.gm = gm
+        self.args = args
+        self.cm = cm
+        self.kwargs = kwargs or {}
+        self.dynamic_shapes = dynamic_shapes
+        self.compiler_kwargs = compiler_kwargs or {}
+        # identify max_batch_size
+        if self.dynamic_shapes is not None and 0 in self.dynamic_shapes[0]:
+            self.max_batch_size = self.dynamic_shapes[0][0].max
+        else:
+            # NOTE: we assume the first input is the main input tensor with batch dimension
+            #batched_input, *_ = _flatten_args(self.gm._in_spec, *self.args, **self.kwargs)
+
+            self.max_batch_size = 2048 #self.args[0].shape[0] #batched_input.shape[0]
+
+
+    def _init_captured_graph(
+        self, gm: nn.Module
+    ) -> CapturedGraph:
+        return CapturedGraph(
+            gm,
+            self.cm,
+            # in_spec=in_spec,
+            # out_spec=out_spec,
+            max_batch_size=self.max_batch_size,
+            cuda_graph_batch_sizes=self.compiler_kwargs.get("cuda_graph_batch_sizes"),
+            num_batched_inputs=self.compiler_kwargs.get("num_batched_inputs"),
+        )
+
+    @torch.inference_mode()
+    def compile(self) -> CapturedGraph:
+        inps = _get_input_tensors(self.gm, self.args)[0][1]
+        print(inps.shape,"inp shape----------------------")
+        if inps.shape[0]==1: #1, total_len
+            print("inp shape---------------fall back")
+            return self.gm
+        captured_model = self._init_captured_graph(self.gm)
+
+        # try capturing cudagraph
+        if self.args is not None or self.kwargs is not None:
+            captured_model.capture_graph(*self.args, **self.kwargs)
+
+        return captured_model
+

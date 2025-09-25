@@ -26,7 +26,7 @@ from ...pyexecutor.scheduler import (
 from ..custom_ops.attention_interface import SequenceInfo
 from ..distributed import common as dist
 from ..models import ModelFactoryRegistry
-from ..transformations.transform import InferenceOptimizer
+from ..transformations.transform import InferenceOptimizer, ThunderInferenceOptimizer
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
@@ -106,7 +106,8 @@ class ADEngine(ModelEngine):
         )
 
         # construct inference optimizer
-        build_and_optimize = InferenceOptimizer(factory=factory, ad_config=ad_config)
+        # build_and_optimize = InferenceOptimizer(factory=factory, ad_config=ad_config)
+        build_and_optimize = ThunderInferenceOptimizer(factory=factory, ad_config=ad_config)
 
         # construct engine
         engine = cls(build_and_optimize, seq_info, device)
@@ -140,7 +141,7 @@ class ADEngine(ModelEngine):
         )
 
         # build model
-        self.model = get_inference_model(self.cache_seq_interface)
+        self.model, self.ori_model = get_inference_model(self.cache_seq_interface)
 
         # start fresh with fixed seed
         torch.manual_seed(1234)
@@ -228,7 +229,8 @@ class ADEngine(ModelEngine):
 
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
-        logits: torch.Tensor = self.model(*self.cache_seq_interface.args)[0]
+        ad_logger.debug("compute_logits: inputs:",len(self.cache_seq_interface.args), self.cache_seq_interface.args[0].shape, self.cache_seq_interface.args[1].shape)
+        logits: torch.Tensor = self.model(*self.cache_seq_interface.args[:2])[0]
 
         # return a list of tensors
         return self.cache_seq_interface.info.unnest_sequences(logits)

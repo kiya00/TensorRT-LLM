@@ -251,6 +251,10 @@ def flashinfer_mha_with_cache(
     k_scale: float,
     v_scale: float,
 ) -> torch.Tensor:
+    q = q.transpose(1, 2).contiguous()
+    k = k.transpose(1, 2).contiguous()
+    v = v.transpose(1, 2).contiguous()
+
     # reshape to standard [b*s, n_heads, head_dim] layout
     head_dim = k_cache.shape[-1]
     q_shape_og = q.shape
@@ -262,7 +266,6 @@ def flashinfer_mha_with_cache(
 
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
-
     pp = PlanParams(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
@@ -302,7 +305,9 @@ def flashinfer_mha_with_cache(
     )
     y = wrapper.run(q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale)
 
-    return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
+    y = y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
+    # back to bnsd
+    return y.transpose(1, 2).contiguous()
 
 
 @flashinfer_mha_with_cache.register_fake
@@ -370,8 +375,10 @@ class FlashInferAttention(AttentionDescriptor):
         cls, source_attn_node: Node, cache_config: CacheConfig
     ) -> CacheInitializerDict:
         # source op is [bsnd] layout already
-        k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
-        num_kv_heads = k_fake.shape[2]
+        #k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
+        k_fake: FakeTensor = source_attn_node.args[1].meta["example_value"]
+        # source op is sdpa, bnsd layout
+        num_kv_heads = k_fake.shape[1]#k_fake.shape[2]
         head_dim = k_fake.shape[3]
 
         def _get_cache(si: SequenceInfo):
@@ -424,3 +431,7 @@ class FlashInferAttention(AttentionDescriptor):
             1.0,  # k_scale
             1.0,  # v_scale
         ]
+
+from thunder.torch.custom_op import _register_custom_op
+_register_custom_op(prepare_flashinfer_metadata)
+_register_custom_op(flashinfer_mha_with_cache)

@@ -145,6 +145,7 @@ def resize_kv_cache(
     egm: GraphModule,
     cm: CachedSequenceInterface,
     free_mem_ratio: float = 0.8,
+    is_thunder: bool = False,
 ) -> None:
     """Inflate the kv cache to occupy the available GPU memory.
 
@@ -172,7 +173,31 @@ def resize_kv_cache(
         cm.info._set_max_num_tokens_sample()
         free_mem_pre, _ = torch.cuda.mem_get_info()
         ad_logger.info(f"Free memory before forward pass (MB): {_to_mb(free_mem_pre)}")
-        egm(*cm.args)
+        if is_thunder:
+            from tensorrt_llm._torch.auto_deploy.compile.backends.thunder_compiler import _get_input_tensors, replace_input
+            placeholders = [n for n in egm.graph.nodes if n.op == "placeholder"]
+            from thunder.dynamo.utils import get_or_create_example_inputs_from_placeholders
+            example_inputs = get_or_create_example_inputs_from_placeholders(placeholders)
+
+            input_tensors = _get_input_tensors(egm,example_inputs)[:2]
+            input_tensors_idx = [a[0] for a in input_tensors]
+            new_inputs = replace_input(cm.args[:2],input_tensors_idx,example_inputs)
+
+            for idx,a in enumerate(new_inputs):
+                if isinstance(a,torch.Tensor):
+                    print(a.shape)
+                else:
+                    # _set_max_num_tokens_sample uses [1, 4096]
+                    new_inputs[idx]=4096
+                    print(a)
+            
+            from thunder.dynamo.benchmark_utils import ThunderCompilerOnGraphModuleSpecification
+            thunder_compiler_on_gm = ThunderCompilerOnGraphModuleSpecification(nv_skip_cache=False,)
+            egm, bd = thunder_compiler_on_gm.compile(egm)
+
+            egm(*new_inputs)
+        else:
+            egm(*cm.args)
         free_mem_post, _ = torch.cuda.mem_get_info()
         ad_logger.info(f"Free memory after forward pass (MB): {_to_mb(free_mem_post)}")
 
@@ -196,3 +221,5 @@ def resize_kv_cache(
 
     # Free memory
     torch.cuda.empty_cache()
+
+

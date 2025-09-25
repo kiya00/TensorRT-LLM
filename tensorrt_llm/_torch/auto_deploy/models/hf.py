@@ -151,7 +151,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # NOTE (lucaslie): HF doesn't recursively update nested PreTrainedConfig objects. Instead,
         # the entire subconfig will be overwritten.
         # we want to recursively update model_config from model_kwargs here.
-        model_config = self.autoconfig_from_pretrained(self.model, trust_remote_code=True)
+        model_config = self.autoconfig_from_pretrained(self.model, trust_remote_code=True)#,num_hidden_layers=2)
         model_config = self._recursive_update_config(model_config, self.model_kwargs)
 
         with (init_empty_weights if device == "meta" else nullcontext)():
