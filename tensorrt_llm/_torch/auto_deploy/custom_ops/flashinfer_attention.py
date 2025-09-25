@@ -251,10 +251,16 @@ def flashinfer_mha_with_cache(
     k_scale: float,
     v_scale: float,
 ) -> torch.Tensor:
+    #print(q.shape)
+    q = q.transpose(1, 2).contiguous()
+    k = k.transpose(1, 2).contiguous()
+    v = v.transpose(1, 2).contiguous()
+
+
     # reshape to standard [b*s, n_heads, head_dim] layout
     head_dim = k_cache.shape[-1]
-    q_shape_og = q.shape
-    b, s = q_shape_og[:2]
+    #q_shape_og = q.shape
+    b, s = q.shape[:2]
 
     q = q.contiguous().view(b * s, -1, head_dim)
     k = k.contiguous().view(b * s, -1, head_dim)
@@ -263,6 +269,21 @@ def flashinfer_mha_with_cache(
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
 
+    if n_kv_heads == 1 and n_heads > 1:
+        # Broadcast k and v to all heads
+        k = k.expand(-1, n_heads, -1)
+        v = v.expand(-1, n_heads, -1)
+    elif n_kv_heads != n_heads:
+        # General repeat_kv logic
+        if n_heads % n_kv_heads == 0:
+            repeat_factor = n_heads // n_kv_heads
+            k = k.repeat_interleave(repeat_factor, dim=1)
+            v = v.repeat_interleave(repeat_factor, dim=1)
+        else:
+            raise ValueError(f"repeat_kv: n_heads ({n_heads}) is not divisible by n_kv_heads ({n_kv_heads})")
+
+    #print("flashinfer attn: ", n_kv_heads, q.shape, k.shape, v.shape)
+    q_shape_og = q.shape
     pp = PlanParams(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
@@ -301,8 +322,25 @@ def flashinfer_mha_with_cache(
         pp,
     )
     y = wrapper.run(q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale)
-
-    return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
+    y = y.view(q_shape_og) 
+    #print("flashinfer out: ",y.shape, q_shape_og, q.shape)
+    return y
+    #return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
+    #y = y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
+    #print("flashinfer out: ",y.shape, q_shape_og)
+    #if len(q_shape_og) == 4:
+    #    # [b, s, n_heads, head_dim]
+    #    y = y.view(q_shape_og)
+    #elif len(q_shape_og) == 3 and q_shape_og[2] == n_heads * head_dim:
+    #    # [b, s, n_heads*head_dim]
+    #    y = y.view(b, s, n_heads, head_dim).reshape(b, s, n_heads * head_dim)
+    #else:
+    #    # fallback
+    #    y = y.view(q_shape_og)
+    #print("flashinfer out: ",y.shape)
+    #return y
+    # back to bnsd
+    #return y.transpose(1, 2).contiguous()
 
 
 @flashinfer_mha_with_cache.register_fake
@@ -370,8 +408,12 @@ class FlashInferAttention(AttentionDescriptor):
         cls, source_attn_node: Node, cache_config: CacheConfig
     ) -> CacheInitializerDict:
         # source op is [bsnd] layout already
+        #bnsd 
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
-        num_kv_heads = k_fake.shape[2]
+        arg0=source_attn_node.args[0].meta["val"]
+        arg2=source_attn_node.args[2].meta["val"]
+        #print("++++++++++++++++:cache init", k_fake.shape, arg0.shape, arg2.shape)
+        num_kv_heads = k_fake.shape[1]
         head_dim = k_fake.shape[3]
 
         def _get_cache(si: SequenceInfo):

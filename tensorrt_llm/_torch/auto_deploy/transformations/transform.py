@@ -231,3 +231,275 @@ class InferenceOptimizer:
         torch.cuda.empty_cache()
         gc.collect()
         return egm_compiled
+
+
+class ThunderInferenceOptimizer:
+    def __init__(
+        self,
+        factory: ModelFactory,
+        *,  # TODO: temporary until we have a better config system
+        ad_config: _AutoDeployLlmArgs,
+        visualize: bool = False,
+    ):
+        self.factory = factory
+
+        self.ad_config = ad_config
+        # Map Pytorch config to AutoDeploy compile backends.
+        if ad_config.use_cuda_graph and ad_config.torch_compile_enabled:
+            compile_backend = "torch-opt"
+        elif ad_config.use_cuda_graph:
+            compile_backend = "torch-cudagraph"
+        elif ad_config.torch_compile_enabled:
+            compile_backend = "torch-compile"
+        else:
+            compile_backend = "torch-simple"
+        self.compile_backend = compile_backend
+        self.visualize = visualize
+
+    def __call__(self, cm: CachedSequenceInterface) -> GraphModule:
+        """Transform a model into an optimized inference model.
+
+        Args:
+            model: The model to transform.
+            cp: The cache pool to use for caching.
+            args: Example inputs to the model.
+            dynamic_shapes: Dynamic shapes to use. Defaults to None.
+            poe_config: The config for positional encoding. Defaults to None.
+            quantization: The quantization method to use. Defaults to None.
+
+        Returns:
+            A GraphModule representing the optimized inference model.
+        """
+        ############################################################################################
+        # INITIALIZE MODEL
+        ############################################################################################
+        model = self.factory.build_model(device="meta")
+
+        ############################################################################################
+        # EXPORT MODEL TO GRAPH MODULE
+        ############################################################################################
+
+        cm.info.set_example_sequence()
+        local_rank, world_size = dist_ad.get_rank_world_size()
+
+        ############################################################################################
+        # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
+        ############################################################################################
+
+        ############################################################################################
+        # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
+        ############################################################################################
+
+        ############################################################################################
+        # MOVE MODEL AND LOAD WEIGHTS
+        ############################################################################################
+
+        # load weights
+        self.factory.load_or_random_init(model, device=self.ad_config.checkpoint_device or cm.device)
+
+        # move remaining parts to device
+        move_to_device(model, cm.device)
+        cm.to(cm.device)
+
+        ############################################################################################
+        # RUN POST-LOAD FUSION AND OPTIMIZATIONS
+        ############################################################################################
+
+        ############################################################################################
+        # SWITCH TO CACHED+FLATTENED ATTENTION + INITIALIZE CACHES
+        ############################################################################################
+
+        ############################################################################################
+        # COMPILE MODEL
+        ############################################################################################
+
+        cm.info.set_generate_only_batch()
+        compiler_kwargs = {
+            "cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes,
+            "num_batched_inputs": 2,  # TODO (lucaslie): improve once we have a config system...
+        }
+        # egm_compiled = compile_and_capture(
+        #     egm,
+        #     self.compile_backend,
+        #     args=cm.args,
+        #     dynamic_shapes=cm.dynamic_shapes,
+        #     compiler_kwargs=compiler_kwargs,
+        # )
+        #from torch._dynamo.backends.debugging import ExplainWithBackend
+        #eb = ExplainWithBackend("inductor")
+        #import copy
+        #model1=copy.deepcopy(model)
+        #optimized_fn = torch.compile(model1, backend=eb)
+        #result = optimized_fn(*cm.args)
+        #g = eb.output().graphs[0]
+        #print(g)
+
+        from thunder.dynamo import thunderfx
+        import thunder
+
+        from thunder.transforms.cudagraph import CUDAGraphTransform
+
+        cgtransform = CUDAGraphTransform()
+
+        #from thunder.transforms.quantization import BitsAndBytesLinearQuant4bit, get_bitsandbytes_executor
+
+        #bitsandbytes_executor = get_bitsandbytes_executor()
+        #executors=(bitsandbytes_executor,),
+        #transforms=[BitsAndBytesLinearQuant4bit()]
+        #egm_compiled = thunderfx(model,executors=[thunder.cudnn_executor, thunder.sdpa_executor, thunder.torchcompile_xentropy_executor,])
+        egm_compiled=model
+        #from ..compile.backends.thunder_fx_cugraph import ThunderOptCompiler
+        #egm_compiled = ThunderOptCompiler(model, cm.args, dynamic_shapes=cm.dynamic_shapes, compiler_kwargs=compiler_kwargs).compile()
+
+        #egm_compiled = thunderfx(model, executors=[bitsandbytes_executor, thunder.cudnn_executor, thunder.sdpa_executor, thunder.torchcompile_xentropy_executor,],transforms=[BitsAndBytesLinearQuant4bit(),cgtransform], disable_torch_autograd=True) #torch.compile(model) #model #thunderfx(model)
+
+        cm.info.reset()
+
+        torch.cuda.empty_cache()
+        gc.collect()
+        return egm_compiled
+
+
+class ThunderInferenceOptimizer1:
+    def __init__(
+        self,
+        factory: ModelFactory,
+        *,  # TODO: temporary until we have a better config system
+        ad_config: _AutoDeployLlmArgs,
+        visualize: bool = False,
+    ):
+        self.factory = factory
+
+        self.ad_config = ad_config
+        # Map Pytorch config to AutoDeploy compile backends.
+        if ad_config.use_cuda_graph and ad_config.torch_compile_enabled:
+            compile_backend = "torch-opt"
+        elif ad_config.use_cuda_graph:
+            compile_backend = "torch-cudagraph"
+        elif ad_config.torch_compile_enabled:
+            compile_backend = "torch-compile"
+        else:
+            compile_backend = "torch-simple"
+        self.compile_backend = compile_backend
+        self.visualize = visualize
+
+    def __call__(self, cm: CachedSequenceInterface) -> GraphModule:
+        """Transform a model into an optimized inference model.
+
+        Args:
+            model: The model to transform.
+            cp: The cache pool to use for caching.
+            args: Example inputs to the model.
+            dynamic_shapes: Dynamic shapes to use. Defaults to None.
+            poe_config: The config for positional encoding. Defaults to None.
+            quantization: The quantization method to use. Defaults to None.
+
+        Returns:
+            A GraphModule representing the optimized inference model.
+        """
+        ############################################################################################
+        # INITIALIZE MODEL
+        ############################################################################################
+        model = self.factory.build_model(device="meta")
+
+
+
+        ############################################################################################
+        # EXPORT MODEL TO GRAPH MODULE
+        ############################################################################################
+        # set info.input_ids and info.position_ids
+        cm.info.set_example_sequence()
+        egm = torch_export_to_gm(model, args=cm.args, dynamic_shapes=cm.dynamic_shapes)
+
+        local_rank, world_size = dist_ad.get_rank_world_size()
+        from thunder.dynamo.utils import _readable
+        with open("exportgm.py",'w') as f:
+            f.write(_readable(egm,"model"))
+
+        ############################################################################################
+        # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
+        ############################################################################################
+
+        ############################################################################################
+        # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
+        ############################################################################################
+
+        ############################################################################################
+        # MOVE MODEL AND LOAD WEIGHTS
+        ############################################################################################
+
+        # load weights
+        self.factory.load_or_random_init(model, device=self.ad_config.checkpoint_device or cm.device)
+
+        # move remaining parts to device
+        move_to_device(model, cm.device)
+        cm.to(cm.device)
+        print(len(cm.args))
+        print("ori args:")
+        for a in cm.args:
+            print(a.shape)
+
+        #return model
+
+        from thunder.dynamo.utils import KVCacheManager as thunder_cache_manager
+        new_args = cm.info.switch_to_cached_attn_inputs()
+        attn_descriptor = AttentionRegistry.get(self.ad_config.attn_backend)
+        cache_config = self.factory.get_cache_config()
+        cmanager = thunder_cache_manager(cm, attn_descriptor, cache_config, self.ad_config)
+        src_attn_nodes = cmanager.get_information(egm)
+        cmanager.update_information(src_attn_nodes)
+
+        cm.initialize_caches()
+        print(len(cm.args))
+        print(model.config.num_key_value_heads, model.config.head_dim,model.config.num_attention_heads,"+++++++++++ config")
+
+
+        self.factory.set_flashinfer_attn(model)
+        cur_args,cur_kwargs = cm.args_and_kwargs
+
+        print(len(cur_args),cur_kwargs.keys())
+        for a in cur_args:
+            print(a.shape)
+        print("--------------------------------")
+        print(model.config.num_key_value_heads, model.config.head_dim,model.config.num_attention_heads,"+++++++++++ config")
+        #xx = torch.export.export(model,cur_args,cur_kwargs)
+        #with open("exportgm_aft.py",'w') as f:
+        #    f.write(str(xx))
+
+        model(*cur_args,**cur_kwargs)
+        resize_kv_cache(model, cm, free_mem_ratio=self.ad_config.free_mem_ratio)
+        #from thunder.dynamo.report import save_thunderfx_repros, fx_report, get_thunder_fxgraph_reports,save_failing_repros
+        ##save_thunderfx_repros(model,"/home/wayan/trtllm/0902gms",force_overwrite=True)(*cur_args,**cur_kwargs)
+        #cur_args,cur_kwargs = cm.args_and_kwargs
+        ##report = fx_report(model)(*cur_args,**cur_kwargs)
+        #report = get_thunder_fxgraph_reports(model)(*cur_args,**cur_kwargs)
+        ## Saves the repros for the failing reports using TorchCompile
+        #from thunder.dynamo.benchmark_utils import ThunderCompileSpecification
+        #save_failing_repros(report, ThunderCompileSpecification(), "repros")
+
+
+        ############################################################################################
+        # COMPILE MODEL
+        ############################################################################################
+
+        cm.info.set_generate_only_batch()
+        compiler_kwargs = {
+            "cuda_graph_batch_sizes": self.ad_config.cuda_graph_batch_sizes,
+            "num_batched_inputs": 2,  # TODO (lucaslie): improve once we have a config system...
+        }
+
+
+
+        from thunder.dynamo import thunderfx
+        import thunder
+        #egm_compiled = thunderfx(model, executors=[thunder.cudnn_executor, thunder.sdpa_executor, thunder.torchcompile_xentropy_executor,]) #torch.compile(model) #model #thunderfx(model)
+        #egm_compiled=thunder.jit(model, executors=[thunder.cudnn_executor, thunder.sdpa_executor, thunder.torchcompile_xentropy_executor,])
+        #egm_compiled = torch.compile(model,dynamic=True)
+
+        egm_compiled = model
+
+        cm.info.reset()
+
+        torch.cuda.empty_cache()
+        gc.collect()
+        return egm_compiled

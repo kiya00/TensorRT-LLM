@@ -26,7 +26,7 @@ from ...pyexecutor.scheduler import (
 from ..custom_ops.attention_interface import SequenceInfo
 from ..distributed import common as dist
 from ..models import ModelFactoryRegistry
-from ..transformations.transform import InferenceOptimizer
+from ..transformations.transform import InferenceOptimizer, ThunderInferenceOptimizer1
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
@@ -106,7 +106,8 @@ class ADEngine(ModelEngine):
         )
 
         # construct inference optimizer
-        build_and_optimize = InferenceOptimizer(factory=factory, ad_config=ad_config)
+        # build_and_optimize = InferenceOptimizer(factory=factory, ad_config=ad_config)
+        build_and_optimize = ThunderInferenceOptimizer1(factory=factory, ad_config=ad_config)
 
         # construct engine
         engine = cls(build_and_optimize, seq_info, device)
@@ -228,7 +229,13 @@ class ADEngine(ModelEngine):
 
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
-        logits: torch.Tensor = self.model(*self.cache_seq_interface.args)[0]
+        #logits: torch.Tensor = self.model(*self.cache_seq_interface.args)[0]
+        cur_args,cur_kwargs = self.cache_seq_interface.args_and_kwargs
+        logits: torch.Tensor = self.model(*cur_args,**cur_kwargs)[0]
+        #from thunder.dynamo.report import save_thunderfx_repros
+        #save_thunderfx_repros(self.model._func,"/home/wayan/trtllm/0902gms",force_overwrite=True)(*cur_args,**cur_kwargs)
+        #print("is saving...")
+        #self.model._backend.save_reproducer_to_folder("/home/wayan/trtllm/0902gms")
 
         # return a list of tensors
         return self.cache_seq_interface.info.unnest_sequences(logits)

@@ -60,6 +60,29 @@ def hf_load_state_dict_with_device(device: DeviceLikeType):
         modeling.load_state_dict = original_load_state_dict
 
 
+def _flashinfer_attn_forward(module: torch.nn.Module, *args, **kwargs):
+    #print("attn +++++++++++++++++++",kwargs.keys(),len(args))
+    cur_idx = module.layer_idx
+    k_cache_key = f"k_cache_{cur_idx}"
+    v_cache_key = f"v_cache_{cur_idx}"
+    #if k_cache_key not in kwargs or v_cache_key not in kwargs:
+    #    raise ValueError(f"no kv cache {cur_idx}")
+    cur_kwargs={"k_cache": kwargs[k_cache_key], "v_cache":kwargs[v_cache_key], "workspace_buffer":kwargs["workspace_buffer"]}
+    keys_to_keep = ["qo_indptr","paged_kv_indptr","paged_kv_indices","paged_kv_last_page_len","batch_indices","positions"]
+    cur_kwargs.update({k: kwargs[k] for k in keys_to_keep if k in kwargs})
+    cur_kwargs["scale"]=kwargs["scaling"]
+    cur_kwargs["k_scale"]=cur_kwargs["v_scale"]=1.0
+    #for a in args:
+    #    print(a.shape)
+    #for k,v in cur_kwargs.items():
+    #    if isinstance(v,torch.Tensor):
+    #        print(f"{k}: {v.shape}")
+    out = torch.ops.attention.flashinfer_mha_with_cache(*args[:3], **cur_kwargs)
+    #print("attn fwd out: ",out.shape)
+    return out, None
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+ALL_ATTENTION_FUNCTIONS["flashinfer_kv_attn"] = _flashinfer_attn_forward
+
 @ModelFactoryRegistry.register("AutoModelForCausalLM")
 class AutoModelForCausalLMFactory(ModelFactory):
     def __init__(
@@ -111,7 +134,23 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         This follows the standard function signature as expected by factory.py.
         """
+        #print("simple fwd: input_ids: ",input_ids.shape)
         return type(model).forward(model, input_ids=input_ids, position_ids=position_ids)
+
+    @staticmethod
+    def _simple_kvcache_forward(model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor, seq_len: torch.Tensor,
+    input_pos: torch.Tensor,
+    cache_loc: torch.Tensor,
+    pages_per_seq: torch.Tensor,**kwargs):
+        #print("simple kvcache fwd: input_ids: ",input_ids.shape)
+        flashinfer_metadata = torch.ops.attention.prepare_flashinfer_metadata(input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size=64)
+        qo_indptr = flashinfer_metadata[0]
+        paged_kv_indptr = flashinfer_metadata[1]
+        paged_kv_indices = flashinfer_metadata[2]
+        paged_kv_last_page_len = flashinfer_metadata[3]
+        batch_indices = flashinfer_metadata[4]
+        positions = flashinfer_metadata[5];
+        return type(model).forward(model, input_ids=input_ids, position_ids=position_ids, qo_indptr=qo_indptr, paged_kv_indptr=paged_kv_indptr, paged_kv_indices=paged_kv_indices, paged_kv_last_page_len=paged_kv_last_page_len, batch_indices=batch_indices, positions=positions, **kwargs)
 
     def _recursive_update_config(self, config: PretrainedConfig, update_dict: Dict[str, Any]):
         """
@@ -142,6 +181,10 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         return config
 
+    def set_flashinfer_attn(self, model: nn.Module):
+        model.config._attn_implementation = "flashinfer_kv_attn"
+        model.forward = types.MethodType(self._simple_kvcache_forward, model)
+
     def build_model(self, device: DeviceLikeType) -> nn.Module:
         """Build the model on the desired device."""
         # We only support fp16 to fp4 conversion.
@@ -151,7 +194,8 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # NOTE (lucaslie): HF doesn't recursively update nested PreTrainedConfig objects. Instead,
         # the entire subconfig will be overwritten.
         # we want to recursively update model_config from model_kwargs here.
-        model_config = self.autoconfig_from_pretrained(self.model, trust_remote_code=True)
+        model_config = self.autoconfig_from_pretrained(self.model, trust_remote_code=True)#,num_hidden_layers=2)
+        # model_config._attn_implementation = "flashinfer_kv_attn"
         model_config = self._recursive_update_config(model_config, self.model_kwargs)
 
         with (init_empty_weights if device == "meta" else nullcontext)():
@@ -164,6 +208,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         # patch forward method
         model.forward = types.MethodType(self._simple_forward, model)
+        # model.forward = types.MethodType(self._simple_kvcache_forward, model)
 
         model.eval()
         return model

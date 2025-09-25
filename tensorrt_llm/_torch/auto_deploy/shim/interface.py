@@ -26,6 +26,10 @@ class CachedSequenceInterface:
         return (*self.info.args, *self._caches.values())
 
     @property
+    def args_and_kwargs(self):
+        return self.info.args, self._caches
+
+    @property
     def dynamic_shapes(self) -> Tuple[Dict[int, Any], ...]:
         """Return the dynamic shapes of all graph arguments owned by this interface (all static)."""
         return self.info.dynamic_shapes + ({},) * len(self._caches)

@@ -172,7 +172,8 @@ def resize_kv_cache(
         cm.info._set_max_num_tokens_sample()
         free_mem_pre, _ = torch.cuda.mem_get_info()
         ad_logger.info(f"Free memory before forward pass (MB): {_to_mb(free_mem_pre)}")
-        egm(*cm.args)
+        cur_args,cur_kwargs = cm.args_and_kwargs
+        egm(*cur_args,**cur_kwargs)
         free_mem_post, _ = torch.cuda.mem_get_info()
         ad_logger.info(f"Free memory after forward pass (MB): {_to_mb(free_mem_post)}")
 
