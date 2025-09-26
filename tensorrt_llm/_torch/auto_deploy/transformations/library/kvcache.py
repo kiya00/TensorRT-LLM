@@ -192,7 +192,7 @@ def resize_kv_cache(
                     print(a)
             
             from thunder.dynamo.benchmark_utils import ThunderCompilerOnGraphModuleSpecification
-            thunder_compiler_on_gm = ThunderCompilerOnGraphModuleSpecification(nv_skip_cache=False,)
+            thunder_compiler_on_gm = ThunderCompilerOnGraphModuleSpecification()
             egm, bd = thunder_compiler_on_gm.compile(egm)
 
             egm(*new_inputs)
@@ -221,5 +221,3 @@ def resize_kv_cache(
 
     # Free memory
     torch.cuda.empty_cache()
-
-

@@ -266,6 +266,7 @@ def flashinfer_mha_with_cache(
 
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
+
     pp = PlanParams(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,

@@ -141,7 +141,7 @@ class ADEngine(ModelEngine):
         )
 
         # build model
-        self.model, self.ori_model = get_inference_model(self.cache_seq_interface)
+        self.model = get_inference_model(self.cache_seq_interface)
 
         # start fresh with fixed seed
         torch.manual_seed(1234)

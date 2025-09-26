@@ -4,19 +4,19 @@ import torch
 import torch.nn as nn
 from torch.cuda import CUDAGraph
 from torch.utils._pytree import TreeSpec, tree_flatten
-import thunder
 
 from ...utils.cuda_graph import CudaGraphWarmUpPhase
 from ...utils.logger import ad_logger
 from ..compiler import BackendCompiler, BackendRegistry, _flatten_args
 
+# Since the Dynamo graph treats all parameters as graph inputs, we identify actual input tensors by checking the type of each placeholder node.
 def _get_input_tensors(gm, args,):
     node_inputs = gm.graph.find_nodes(op="placeholder", sort=True)
-    input_tensor_list = [[idx, arg] for idx,(n,arg) in enumerate(zip(node_inputs,args)) if n.type is torch.Tensor and not n.type is torch.nn.Parameter]
-    print(len(input_tensor_list),"++++++++++++")
-    return input_tensor_list
+    input_tensor_idx_val_list = [[idx, arg] for idx,(n,arg) in enumerate(zip(node_inputs,args)) if n.type is torch.Tensor and not n.type is torch.nn.Parameter]
+    return input_tensor_idx_val_list
 
-def replace_input(target,indexes,result):
+
+def replace_input(target, indexes, result):
     assert len(target)==len(indexes), "replace inputs mismatch"
     t_iter = iter(target)
     return [next(t_iter) if idx in indexes else a for idx,a in enumerate(result)]
@@ -28,11 +28,9 @@ def pad_to_bucket(input_ids, position_ids, bucket_bs, pad_token_id=0):
     assert pad_len >= 0, "bucket_bs must be >= bs"
 
     if pad_len > 0:
-        # 构造 padding 部分
         pad_input_ids = torch.full((pad_len, 1), pad_token_id, dtype=input_ids.dtype, device=input_ids.device)
         pad_position_ids = torch.zeros((pad_len, 1), dtype=position_ids.dtype, device=position_ids.device)
 
-        # 拼接原始和 padding
         input_ids = torch.cat([input_ids, pad_input_ids], dim=0)
         position_ids = torch.cat([position_ids, pad_position_ids], dim=0)
 
@@ -77,28 +75,6 @@ class CapturedGraph(nn.Module):
         """Round batch size to the nearest cuda batch size."""
         return self.round_up_to_closest(self.cuda_graph_batch_sizes, bs)
 
-    def _capture_one_graph(self, *args, **kwargs) -> torch.cuda.CUDAGraph:
-        """Capture and return one cuda graph."""
-        # warm-up
-        with CudaGraphWarmUpPhase():
-            for _ in range(3):
-                thunder.jit(self.model)(*args, **kwargs)
-
-        # capture graph now
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            # compute output
-            out = thunder.jit(self.model)(*args, **kwargs)
-            # write out into output buffer up to out batch size
-            out_flat, out_spec = tree_flatten(out)
-            assert out_spec == self._out_spec, "Output spec mismatch."
-            for o_buffer, o in zip(self._out_buffer_flat, out_flat):
-                o_buffer[: o.shape[0]] = o
-        torch.cuda.synchronize()
-
-        return graph
-
     @staticmethod
     def _get_graph_batch_sizes(
         max_bs: int, extra: Optional[List[int]] = None, multiplier: int = 128
@@ -118,12 +94,10 @@ class CapturedGraph(nn.Module):
         new_args_iter=iter(new_batched_args)
         all_new_args = [next(new_args_iter) if idx in args_idxes else arg for idx,arg in enumerate(old_args)]
 
+        # replace the dynamic shape symInt with the current used shape
         for idx,a in enumerate(all_new_args):
             if isinstance(a, int):
-                print(a, bs)
                 all_new_args[idx]=bs
-            else:
-                print(a.shape)
         return all_new_args
 
 
@@ -132,12 +106,11 @@ class CapturedGraph(nn.Module):
         # flatten args, kwargs
 
         # extract the batched input tensors
-        # args_batched = all_args_flat[: self.num_batched_inputs]
-        # args_static = all_args_flat[self.num_batched_inputs :]
-        args_lists = _get_input_tensors(self.model, args)[:2]
+        # args correspond to the dynamo graph inputs(including parameters), cm.args only contains original inputs
+        args_lists = _get_input_tensors(self.model, args)[:self.num_batched_inputs]
         args_idxes = [a[0] for a in args_lists]
-        #args_batched = [a[1] for a in args_lists]
-        args_batched = self.cm.args[:2]
+        args_batched = self.cm.args[:self.num_batched_inputs]
+        # TODO: there is problem when using max_batch_size=2048, seems oom
         self.max_batch_size=512
 
         # set the args hash --> this is used to compare the static inputs during graph replay
@@ -146,18 +119,17 @@ class CapturedGraph(nn.Module):
         # sanity checks on the batched inputs
         msg_bs = "Max batch size too small."
         msg_ndim = "Expecting at least a 2D for batched input tensors."
-        #assert all(self.max_batch_size >= input.shape[0] for input in args_batched), msg_bs
+        # assert all(self.max_batch_size >= input.shape[0] for input in args_batched), msg_bs
         assert all(input.ndim > 1 for input in args_batched), msg_ndim
 
         self._input_buffers = [
             input[:1].repeat_interleave(self.max_batch_size, dim=0) for input in args_batched
         ]
-        # map_to_new_args(old_args, args_idxes, new_batched_args, bs)
         new_args = self.map_to_new_args(args, args_idxes, self._input_buffers, self.max_batch_size)
+        # capture output once with max batch size to capture output buffers
         with CudaGraphWarmUpPhase():
             out = self.model(*new_args)
         self._out_buffer_flat, self.out_spec = tree_flatten(out)
-        # assert out_spec == self._out_spec, "Output spec mismatch."
 
         # capture graph now for a range of batch sizes
         for bs in self.cuda_graph_batch_sizes:
@@ -170,15 +142,17 @@ class CapturedGraph(nn.Module):
             # capture graph for truncated inputs
             combined_shape = sum((input.shape for input in inputs_truncated), start=())
 
-            #print("start+++++++++++++++")
-            #self.model(*all_new_args)
-            #print("end++++++++++++++++++")
-            from thunder.dynamo.benchmark_utils import ThunderCompilerOnGraphModuleSpecification
-            thunder_compiler_on_gm = ThunderCompilerOnGraphModuleSpecification(nv_skip_cache=False,)
-            split_gm, bd = thunder_compiler_on_gm.compile(self.model)
+            # first apply thunder
+            from thunder.dynamo import ThunderCompiler
+            from thunder.executors.custom_op_ex import custom_op_ex
+            from thunder import get_default_executors
+            executor_list = get_default_executors()
+            thunder_compiler = ThunderCompiler(executors=[*executor_list, custom_op_ex])
+            split_gm = thunder_compiler(self.model, sample_args=None)
             #split_gm = torch.compile(self.model)
             #split_gm = self.model
 
+            # then apply cudagraph
             with CudaGraphWarmUpPhase():
                 for _ in range(3):
                     split_gm(*new_args)
@@ -200,17 +174,11 @@ class CapturedGraph(nn.Module):
 
     def forward(self, *args, **kwargs) -> Any:
         """Run the compiled graph."""
-        # flatten args, kwargs
-        # all_args_flat = _flatten_args(self._in_spec, *args, **kwargs)
-
         # extract the batched input tensors
-        # args_batched = all_args_flat[: self.num_batched_inputs]
-        # args_static = all_args_flat[self.num_batched_inputs :]
-        args_lists = _get_input_tensors(self.model, args)[:2]
+        args_lists = _get_input_tensors(self.model, args)[:self.num_batched_inputs]
         args_idxes = [a[0] for a in args_lists]
-        #args_batched = [a[1] for a in args_lists]
         args_batched = [args[i] for i in args_idxes]
-        args_batched = args_batched[:2]
+        args_batched = args_batched[:self.num_batched_inputs]
         ori_bs=args_batched[0].shape[0]
 
         # check if args_static match the stored hash
@@ -226,34 +194,20 @@ class CapturedGraph(nn.Module):
 
         # regular forward for non-matching shapes
         if combined_shape not in self.graphs:
-            # return self.model(*args, **kwargs)
-            print("bucket fallback: ", args_batched[0].shape, args_batched[1].shape)
-            #return thunder.jit(self.model)(*args)
-            return torch.compile(self.model)(*args)
-        print("bucket hit:", args_batched[0].shape, args_batched[1].shape, rounded_shapes)
-        #*new_args,_=pad_to_bucket(*args_batched,rounded_shapes[0][0])
-        #print(new_args[0].shape)
+            ad_logger.debug(f"bucket fallback to eager: {args_batched[0].shape}, {args_batched[1].shape}")
+            return self.model(*args)
+        ad_logger.debug(f"bucket hit: {args_batched[0].shape}, {args_batched[1].shape}, round to: {rounded_shapes}")
+
         # copy inputs to input buffers
         for i, input_tensor in enumerate(args_batched):
             self._input_buffers[i][: input_tensor.shape[0]] = input_tensor
-        #new_args = self.map_to_new_args(args, args_idxes, self._input_buffers, rounded_shapes[0][0])
+
+        # run forward pass via graph
         self.graphs[combined_shape].replay()
+
+        # retrieve output from buffer, cut to batch size, and unflatten
         out=[o[:ori_bs].detach().clone() for o in self._out_buffer_flat]
         return self.out_spec.unflatten(out)
-
-        # # copy inputs to input buffers
-        # # for i, input_tensor in enumerate(args_batched):
-        # #     self._input_buffers[i][: input_tensor.shape[0]] = input_tensor
-
-        # # # run forward pass via graph
-        # # self.graphs[combined_shape].replay()
-
-        # # retrieve output from buffer, cut to batch size, and unflatten
-        # bs = args_batched[0].shape[0]
-        # out_flat = [o_b[:bs].detach().clone() for o_b in self._out_buffer_flat]
-        # return self._out_spec.unflatten(out_flat)
-
-
 
 @BackendRegistry.register("thunder")
 class ThunderOptCompiler(BackendCompiler):
@@ -278,8 +232,9 @@ class ThunderOptCompiler(BackendCompiler):
         else:
             # NOTE: we assume the first input is the main input tensor with batch dimension
             #batched_input, *_ = _flatten_args(self.gm._in_spec, *self.args, **self.kwargs)
-
-            self.max_batch_size = 2048 #self.args[0].shape[0] #batched_input.shape[0]
+            # self.max_batch_size = batched_input.shape[0]
+            input_tensor_idx_val_list = _get_input_tensors(self.gm, self.args)
+            self.max_batch_size = input_tensor_idx_val_list[0][1].shape[0]
 
 
     def _init_captured_graph(
@@ -288,8 +243,6 @@ class ThunderOptCompiler(BackendCompiler):
         return CapturedGraph(
             gm,
             self.cm,
-            # in_spec=in_spec,
-            # out_spec=out_spec,
             max_batch_size=self.max_batch_size,
             cuda_graph_batch_sizes=self.compiler_kwargs.get("cuda_graph_batch_sizes"),
             num_batched_inputs=self.compiler_kwargs.get("num_batched_inputs"),
@@ -297,11 +250,13 @@ class ThunderOptCompiler(BackendCompiler):
 
     @torch.inference_mode()
     def compile(self) -> CapturedGraph:
-        inps = _get_input_tensors(self.gm, self.args)[0][1]
-        print(inps.shape,"inp shape----------------------")
-        if inps.shape[0]==1: #1, total_len
-            print("inp shape---------------fall back")
+        fst_input = _get_input_tensors(self.gm, self.args)[0][1]
+        # Bucketing is currently applied only along the batch size dimension.
+        # If the sequence length is dynamic, the compiler falls back to eager mode.
+        if fst_input.shape[0]==1: #1, total_len
+            ad_logger.debug(f"fallback to eager for [1, total_len]: {fst_input.shape}")
             return self.gm
+
         captured_model = self._init_captured_graph(self.gm)
 
         # try capturing cudagraph

@@ -169,9 +169,12 @@ class CapturedGraph(nn.Module):
             #print("start+++++++++++++++")
             #self.model(*all_new_args)
             #print("end++++++++++++++++++")
-            from thunder.dynamo.benchmark_utils import ThunderCompilerOnGraphModuleSpecification
-            thunder_compiler_on_gm = ThunderCompilerOnGraphModuleSpecification(nv_skip_cache=False,)
-            split_gm, bd = thunder_compiler_on_gm.compile(self.model)
+            from thunder.dynamo import ThunderCompiler
+            from thunder.executors.custom_op_ex import custom_op_ex
+            from thunder import get_default_executors
+            executor_list = get_default_executors()
+            thunder_compiler = ThunderCompiler(executors=[*executor_list, custom_op_ex])
+            split_gm = thunder_compiler(self.model, sample_args=None)
 
             #jmodel = thunder.jit(self.model)
             # warmup
