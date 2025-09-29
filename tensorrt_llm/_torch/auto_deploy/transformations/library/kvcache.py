@@ -184,16 +184,19 @@ def resize_kv_cache(
             new_inputs = replace_input(cm.args[:2],input_tensors_idx,example_inputs)
 
             for idx,a in enumerate(new_inputs):
-                if isinstance(a,torch.Tensor):
-                    print(a.shape)
-                else:
+                if not isinstance(a, torch.Tensor):
+                    print(a)
                     # _set_max_num_tokens_sample uses [1, 4096]
                     new_inputs[idx]=4096
-                    print(a)
             
-            from thunder.dynamo.benchmark_utils import ThunderCompilerOnGraphModuleSpecification
-            thunder_compiler_on_gm = ThunderCompilerOnGraphModuleSpecification()
-            egm, bd = thunder_compiler_on_gm.compile(egm)
+            from thunder.dynamo import ThunderCompiler
+            from thunder.executors.custom_op_ex import custom_op_ex
+            from thunder import get_default_executors
+            executor_list = get_default_executors()
+            thunder_compiler = ThunderCompiler(executors=[*executor_list, custom_op_ex])
+            egm = thunder_compiler(egm, sample_args=None)
+            # print(thunder_compiler.subgraph_infos)
+
 
             egm(*new_inputs)
         else:
