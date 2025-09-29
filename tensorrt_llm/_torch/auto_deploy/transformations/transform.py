@@ -333,10 +333,12 @@ class ThunderInferenceOptimizer1:
 
         from thunder.dynamo import thunderfx
         import thunder
+        # TODO: the torch.compile and thunder both fail
         #egm_compiled = thunderfx(model, executors=[thunder.cudnn_executor, thunder.sdpa_executor, thunder.torchcompile_xentropy_executor,]) #torch.compile(model) #model #thunderfx(model)
         #egm_compiled=thunder.jit(model, executors=[thunder.cudnn_executor, thunder.sdpa_executor, thunder.torchcompile_xentropy_executor,])
         #egm_compiled = torch.compile(model,dynamic=True)
 
+        # NOTE: This PR is a quick test, it may contain bugs
         egm_compiled = model
 
         cm.info.reset()
