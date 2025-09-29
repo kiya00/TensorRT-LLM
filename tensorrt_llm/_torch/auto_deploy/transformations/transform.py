@@ -323,7 +323,8 @@ class ThunderInferenceOptimizer:
         def optim(gm, stats):
             ad_logger.debug(f"before transform_graph, cm.info.args: {len(cm.info.args)}, {cm.info.args[0].shape}, {cm.info.args[1].shape}")
             ad_logger.debug(f"gm before transform_graph: {str(gm)}")
-            gm1 = cmanager.transform_graph(stats.gm, cm, cached_attn_args_names)
+            # the match_attention_layout is not added, so the source op is not attn_descriptor.get_source_attention_op
+            gm1 = cmanager.transform_graph(stats.gm, cm, cached_attn_args_names, torch._C._nn.scaled_dot_product_attention)
             ad_logger.debug(f"after transform_graph, cm.info.args: {len(cm.info.args)}, {cm.info.args[0].shape}, {cm.info.args[1].shape}")
             ad_logger.debug(f"gm after transform_graph: {str(gm1)}")
             # from thunder.dynamo.utils import has_symbolic_input
