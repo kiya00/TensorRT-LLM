@@ -322,25 +322,7 @@ def flashinfer_mha_with_cache(
         pp,
     )
     y = wrapper.run(q, (k_cache, v_cache), k_scale=k_scale, v_scale=v_scale)
-    y = y.view(q_shape_og) 
-    #print("flashinfer out: ",y.shape, q_shape_og, q.shape)
-    return y
-    #return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
-    #y = y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
-    #print("flashinfer out: ",y.shape, q_shape_og)
-    #if len(q_shape_og) == 4:
-    #    # [b, s, n_heads, head_dim]
-    #    y = y.view(q_shape_og)
-    #elif len(q_shape_og) == 3 and q_shape_og[2] == n_heads * head_dim:
-    #    # [b, s, n_heads*head_dim]
-    #    y = y.view(b, s, n_heads, head_dim).reshape(b, s, n_heads * head_dim)
-    #else:
-    #    # fallback
-    #    y = y.view(q_shape_og)
-    #print("flashinfer out: ",y.shape)
-    #return y
-    # back to bnsd
-    #return y.transpose(1, 2).contiguous()
+    return y.view(q_shape_og)  # [b,s,n*h_d] or [b,s, n, h_d]
 
 
 @flashinfer_mha_with_cache.register_fake
@@ -410,9 +392,6 @@ class FlashInferAttention(AttentionDescriptor):
         # source op is [bsnd] layout already
         #bnsd 
         k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
-        arg0=source_attn_node.args[0].meta["val"]
-        arg2=source_attn_node.args[2].meta["val"]
-        #print("++++++++++++++++:cache init", k_fake.shape, arg0.shape, arg2.shape)
         num_kv_heads = k_fake.shape[1]
         head_dim = k_fake.shape[3]
 
